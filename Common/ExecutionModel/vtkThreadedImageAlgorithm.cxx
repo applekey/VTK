@@ -72,7 +72,7 @@ vtkImageData   **Outputs;
         this->Str->Inputs, this->Str->Outputs,
         extent, 1);
     }
-    };
+  };
 #else
 
   class vtkThreadedImageAlgorithmFunctor
