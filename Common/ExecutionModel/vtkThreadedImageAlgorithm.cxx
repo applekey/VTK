@@ -13,7 +13,6 @@
 
 =========================================================================*/
 #include "vtkThreadedImageAlgorithm.h"
-
 #include "vtkCellData.h"
 #include "vtkCommand.h"
 #include "vtkDataArray.h"
@@ -24,13 +23,104 @@
 #include "vtkObjectFactory.h"
 #include "vtkPointData.h"
 #include "vtkStreamingDemandDrivenPipeline.h"
+#include "vtkExtentTranslator.h"
 
+
+#define USE_SMP_DEFAULT_2D_BLOCK
+
+// the default 2d block is used to compare with tbb's own 2d splitting option
+#ifdef USE_SMP_DEFAULT_2D_BLOCK
+
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range2d.h>
+
+#else
+
+#include "vtkSMPTools.h"
+
+#endif
+
+struct vtkImageThreadStruct
+{
+  vtkThreadedImageAlgorithm *Filter;
+  vtkInformation *Request;
+  vtkInformationVector **InputsInfo;
+  vtkInformationVector *OutputsInfo;
+  vtkImageData   ***Inputs;
+  vtkImageData   **Outputs;
+};
+
+#ifdef USE_SMP_DEFAULT_2D_BLOCK
+
+class vtkApplyTransformTBB
+{
+  vtkImageThreadStruct* Str;
+public:
+
+  vtkApplyTransformTBB(vtkImageThreadStruct* threadStruct)
+  {
+    this->Str = threadStruct;
+  }
+  void operator()(const tbb::blocked_range2d<vtkIdType>& r) const
+  {
+    int extent[6]  = { 0, -1, 0, -1, 0, -1 };
+    extent[0] = r.cols().begin();
+    extent[1] = r.cols().end();
+    extent[2] = r.rows().begin();
+    extent[3] = r.rows().end();
+    extent[4] = 0;
+    extent[5] = 0;
+
+    this->Str->Filter->ThreadedRequestData(this->Str->Request,
+      this->Str->InputsInfo, this->Str->OutputsInfo,
+      this->Str->Inputs, this->Str->Outputs,
+      extent, 1);
+  }
+};
+
+#else
+
+class vtkThreadedImageAlgorithmFunctor
+{
+  vtkImageThreadStruct *Str;
+  int  Extents[6];
+  int Threads;
+  vtkExtentTranslator * ExtentTranslator;
+
+public:
+  vtkThreadedImageAlgorithmFunctor(vtkImageThreadStruct * threadStruct,int* ext,int threads)
+  {
+    this->Str = threadStruct;
+    this->Threads = threads;
+    this->ExtentTranslator = vtkExtentTranslator::New();
+    memcpy(this->Extents,ext,sizeof(int)*6);
+
+  }
+
+  void operator()(vtkIdType begin, vtkIdType end)
+  {
+    for (int i =begin;i<=end;i++)
+    {
+        int splitExtent[6]= { 0, -1, 0, -1, 0, -1 };
+        // 3 option is split by block mode.
+        this->ExtentTranslator->PieceToExtentThreadSafe(i,this->Threads,0,this->Extents,splitExtent,3,0);
+        this->Str->Filter->ThreadedRequestData(this->Str->Request,
+                                     this->Str->InputsInfo, this->Str->OutputsInfo,
+                                     this->Str->Inputs, this->Str->Outputs,
+                                     splitExtent, i);
+    }
+  }
+};
+
+#endif
 
 //----------------------------------------------------------------------------
 vtkThreadedImageAlgorithm::vtkThreadedImageAlgorithm()
 {
   this->Threader = vtkMultiThreader::New();
   this->NumberOfThreads = this->Threader->GetNumberOfThreads();
+  this->NumberOfSMPBlocks = 900;// The default number of SMP blocks.
+  this->UseSmp = true; // turn on smp by default
 }
 
 //----------------------------------------------------------------------------
@@ -47,15 +137,21 @@ void vtkThreadedImageAlgorithm::PrintSelf(ostream& os, vtkIndent indent)
   os << indent << "NumberOfThreads: " << this->NumberOfThreads << "\n";
 }
 
-struct vtkImageThreadStruct
+void vtkThreadedImageAlgorithm::EnableSMP(bool state)
 {
-  vtkThreadedImageAlgorithm *Filter;
-  vtkInformation *Request;
-  vtkInformationVector **InputsInfo;
-  vtkInformationVector *OutputsInfo;
-  vtkImageData   ***Inputs;
-  vtkImageData   **Outputs;
-};
+  this->UseSmp = state;
+}
+
+void vtkThreadedImageAlgorithm::SetSMPBlocks(int numberOfBlocks)
+{
+  if (numberOfBlocks<0)
+  {
+    vtkDebugMacro("Number of SMP Blocks cannot be less than 0");
+    return;
+  }
+  this->NumberOfSMPBlocks =numberOfBlocks;
+}
+
 
 //----------------------------------------------------------------------------
 // For streaming and threads.  Splits output update extent into num pieces.
@@ -230,6 +326,9 @@ int vtkThreadedImageAlgorithm::RequestData(
   str.InputsInfo = inputVector;
   str.OutputsInfo = outputVector;
 
+
+  int updateExtent[6] = { 0, -1, 0, -1, 0, -1 };
+  bool updateExtentsFound = false;
   // now we must create the output array
   str.Outputs = 0;
   if (this->GetNumberOfOutputPorts())
@@ -243,13 +342,14 @@ int vtkThreadedImageAlgorithm::RequestData(
       str.Outputs[i] = outData;
       if (outData)
         {
-        int updateExtent[6];
+
         info->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT(),
                   updateExtent);
 
         // unlike geometry filters, for image filters data is pre-allocated
         // in the superclass (which means, in this class)
         this->AllocateOutputData(outData, info, updateExtent);
+        updateExtentsFound = true;
         }
       }
     }
@@ -274,6 +374,12 @@ int vtkThreadedImageAlgorithm::RequestData(
           vtkInformation* info = portInfo->GetInformationObject(j);
           str.Inputs[i][j] = vtkImageData::SafeDownCast(
             info->Get(vtkDataObject::DATA_OBJECT()));
+
+            if(!updateExtentsFound && this->UseSmp)
+            {
+              info->Get(vtkStreamingDemandDrivenPipeline::UPDATE_EXTENT(),
+                  updateExtent);
+            }
           }
         }
       }
@@ -285,14 +391,32 @@ int vtkThreadedImageAlgorithm::RequestData(
     this->CopyAttributeData(str.Inputs[0][0],str.Outputs[0],inputVector);
     }
 
-  this->Threader->SetNumberOfThreads(this->NumberOfThreads);
-  this->Threader->SetSingleMethod(vtkThreadedImageAlgorithmThreadedExecute, &str);
+  if (this->UseSmp)
+  {
+    #ifdef USE_SMP_DEFAULT_2D_BLOCK
 
-  // always shut off debugging to avoid threading problems with GetMacros
-  bool debug = this->Debug;
-  this->Debug = false;
-  this->Threader->SingleMethodExecute();
-  this->Debug = debug;
+    tbb::parallel_for(tbb::blocked_range2d<vtkIdType>(updateExtent[0],updateExtent[1],updateExtent[2],updateExtent[3]), vtkApplyTransformTBB(&str));
+
+    #else
+
+    vtkThreadedImageAlgorithmFunctor functor(&str,updateExtent,NumberOfSMPBlocks);
+    vtkSMPTools::For(0, NumberOfSMPBlocks-1, functor);
+
+    #endif
+  }
+  else
+  {
+    this->Threader->SetNumberOfThreads(this->NumberOfThreads);
+    this->Threader->SetSingleMethod(vtkThreadedImageAlgorithmThreadedExecute, &str);
+    // always shut off debugging to avoid threading problems with GetMacros
+    bool debug = this->Debug;
+    this->Debug = false;
+    this->Threader->SingleMethodExecute();
+    this->Debug = debug;
+  }
+
+
+
 
   // free up the arrays
   for (i = 0; i < this->GetNumberOfInputPorts(); ++i)
@@ -333,4 +457,3 @@ void vtkThreadedImageAlgorithm::ThreadedExecute(
   (void)threadId;
   vtkErrorMacro("Subclass should override this method!!!");
 }
-
